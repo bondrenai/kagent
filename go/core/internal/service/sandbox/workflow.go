@@ -25,6 +25,27 @@ func (s *Service) run(ctx context.Context, id string, kind apiv1.RuntimeOperatio
 	if err != nil {
 		return nil, sandboxError(err)
 	}
+	return s.runOperation(ctx, op, kind)
+}
+
+// expire rechecks the deadline under the operation lock. A sandbox may have
+// completed suspension or resumed since the expiration worker selected it.
+func (s *Service) expire(ctx context.Context, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, database.RuntimeOperationTimeout)
+	defer cancel()
+	op, err := s.config.Store.BeginExpiredSandboxDeletion(ctx, id)
+	if errors.Is(err, database.ErrFailedPrecondition) {
+		return nil
+	}
+	if err != nil {
+		return sandboxError(err)
+	}
+	_, err = s.runOperation(ctx, op, apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE)
+	return err
+}
+
+func (s *Service) runOperation(ctx context.Context, op *database.SandboxOperation, kind apiv1.RuntimeOperation) (_ *apiv1.Sandbox, err error) {
+	id := op.Instance.Id
 	if op.Instance.Operation != kind {
 		return op.Instance, nil
 	}
@@ -103,7 +124,7 @@ func (s *Service) Start(ctx context.Context) error {
 			group.SetLimit(4)
 			for _, id := range ids {
 				group.Go(func() error {
-					if _, err := s.run(ctx, id, apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE); err != nil && !errors.Is(err, database.ErrConflict) && ctx.Err() == nil {
+					if err := s.expire(ctx, id); err != nil && !errors.Is(err, database.ErrConflict) && ctx.Err() == nil {
 						logging.FromContext(ctx).ErrorContext(ctx, "expire sandbox", "sandbox_id", id, "error", err)
 					}
 					return nil

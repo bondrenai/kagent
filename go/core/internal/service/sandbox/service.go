@@ -96,6 +96,7 @@ func (s *Service) Create(ctx context.Context, request *apiv1.CreateSandboxReques
 	}
 	instance, _, err := s.config.Store.CreateSandbox(ctx, &apiv1.Sandbox{
 		Id: id.String(), Creator: principal.ID, Name: request.Name, SandboxTemplate: ref,
+		RetainWhileSuspended: request.GetRetainWhileSuspended(),
 	}, request.RequestId, database.SandboxCreateOptions{RequestHash: hash, TemplateUID: string(template.UID), TTL: ttl})
 	if errors.Is(err, database.ErrNotFound) {
 		return nil, serviceerrors.NewFailedPrecondition("SandboxTemplate has no prepared revision", err)

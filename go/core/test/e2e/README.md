@@ -21,6 +21,10 @@ KAGENT_E2E_RUNTIME_IMAGE=<digest-pinned-go-adk-image> \
   go test ./core/test/e2e -run '^TestSandbox' -v -count=1 -timeout 15m
 ```
 
+Set `KAGENT_E2E_SANDBOX_SNAPSHOT_LOCATION` when the deployment requires another
+snapshot location, such as `gs://ate-snapshots/sandbox-e2e/`. When omitted, the
+fixtures use `s3://ate-snapshots/<sandbox namespace>`.
+
 The controller restart test needs a stable service endpoint (NodePort or ingress);
 `kubectl port-forward` exits when the selected pod is replaced. The suite tests
 public gRPC/MCP calls, owner isolation, binary files, process execution/output,

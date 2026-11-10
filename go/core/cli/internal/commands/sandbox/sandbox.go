@@ -85,6 +85,7 @@ func newTemplatesCmd() *cobra.Command {
 func newCreateCmd() *cobra.Command {
 	var requestID, name string
 	var ttl time.Duration
+	var retainWhileSuspended bool
 	cmd := &cobra.Command{
 		Use: "create TEMPLATE --request-id ID", Short: "Create a sandbox from a prepared template", Args: cobra.ExactArgs(1),
 		Long: "Create a sandbox. Retain --request-id and all inputs for retries; each call makes one lifecycle attempt. Activity does not extend the TTL.",
@@ -98,6 +99,7 @@ func newCreateCmd() *cobra.Command {
 			return withClient(cmd, func(ctx context.Context, c *client.SandboxClient, options connection.Options, format clioutput.Format) error {
 				request := &apiv1.CreateSandboxRequest{
 					SandboxTemplate: &apiv1.ResourceReference{Namespace: options.Namespace, Name: args[0]}, RequestId: requestID, Name: name,
+					RetainWhileSuspended: retainWhileSuspended,
 				}
 				if cmd.Flags().Changed("ttl") {
 					request.Ttl = durationpb.New(ttl)
@@ -113,6 +115,7 @@ func newCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&requestID, "request-id", "", "Stable idempotency key; reuse with identical inputs for retries")
 	cmd.Flags().StringVar(&name, "name", "", "Display name")
 	cmd.Flags().DurationVar(&ttl, "ttl", 0, "Lifetime (omission uses operator policy)")
+	cmd.Flags().BoolVar(&retainWhileSuspended, "retain-while-suspended", false, "Keep durable files without expiry while suspended; each resume starts a fresh TTL interval")
 	_ = cmd.MarkFlagRequired("request-id")
 	return cmd
 }
@@ -199,7 +202,13 @@ func writeSandboxesTable(out io.Writer, values []*apiv1.Sandbox) error {
 		return err
 	}
 	for _, value := range values {
-		if _, err := fmt.Fprintf(w, "%s\t%s/%s\t%s\t%s\t%s\t%s\n", value.Id, value.SandboxTemplate.GetNamespace(), value.SandboxTemplate.GetName(), value.State, value.Operation, value.ExpiresAt.AsTime().Format(time.RFC3339), value.Failure.GetMessage()); err != nil {
+		expires := "-"
+		if value.ExpiresAt != nil {
+			expires = value.ExpiresAt.AsTime().Format(time.RFC3339)
+		} else if value.RetainWhileSuspended && value.State == apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED && value.Operation == apiv1.RuntimeOperation_RUNTIME_OPERATION_NONE {
+			expires = "retained while suspended"
+		}
+		if _, err := fmt.Fprintf(w, "%s\t%s/%s\t%s\t%s\t%s\t%s\n", value.Id, value.SandboxTemplate.GetNamespace(), value.SandboxTemplate.GetName(), value.State, value.Operation, expires, value.Failure.GetMessage()); err != nil {
 			return err
 		}
 	}

@@ -53,6 +53,10 @@ func newSandboxFixture(t *testing.T) *sandboxFixture {
 	if pool == "" {
 		pool = kagentenv.E2ESandboxWorkerPool.DefaultValue()
 	}
+	snapshotLocation := kagentenv.E2ESandboxSnapshotLocation.Get()
+	if snapshotLocation == "" {
+		snapshotLocation = "s3://ate-snapshots/" + namespace
+	}
 	conn := newControllerConn(t, target)
 	ctx, cancel := context.WithTimeout(metadata.AppendToOutgoingContext(t.Context(), "x-user-id", "e2e"), 6*time.Minute)
 	t.Cleanup(cancel)
@@ -62,7 +66,7 @@ func newSandboxFixture(t *testing.T) *sandboxFixture {
 			"workload": map[string]any{"image": image},
 			"substrate": map[string]any{
 				"workerPoolRef":  map[string]any{"name": pool},
-				"snapshotPolicy": map[string]any{"location": "s3://ate-snapshots/" + namespace},
+				"snapshotPolicy": map[string]any{"location": snapshotLocation},
 			},
 		},
 	})
@@ -85,7 +89,13 @@ func newSandboxFixture(t *testing.T) *sandboxFixture {
 
 func (f *sandboxFixture) create(t *testing.T, ttl time.Duration) *apiv1.Sandbox {
 	t.Helper()
-	request := &apiv1.CreateSandboxRequest{SandboxTemplate: f.template, RequestId: uuid.NewString(), Ttl: durationpb.New(ttl)}
+	return f.createRequest(t, &apiv1.CreateSandboxRequest{Ttl: durationpb.New(ttl)})
+}
+
+func (f *sandboxFixture) createRequest(t *testing.T, request *apiv1.CreateSandboxRequest) *apiv1.Sandbox {
+	t.Helper()
+	request.SandboxTemplate = f.template
+	request.RequestId = uuid.NewString()
 	var instance *apiv1.Sandbox
 	var lastErr error
 	err := wait.PollUntilContextTimeout(f.ctx, time.Second, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
@@ -313,6 +323,71 @@ func TestSandboxExpiration(t *testing.T) {
 	f := newSandboxFixture(t)
 	sandbox := f.create(t, 15*time.Second)
 	f.wait(t, sandbox.Id, apiv1.RuntimeState_RUNTIME_STATE_DELETED)
+}
+
+func TestSandboxRetentionWhileSuspended(t *testing.T) {
+	t.Parallel()
+	f := newSandboxFixture(t)
+	const activeTTL = 90 * time.Second
+	sandbox := f.createRequest(t, &apiv1.CreateSandboxRequest{
+		Ttl: durationpb.New(activeTTL), RetainWhileSuspended: true,
+	})
+	id := sandbox.Id
+	require.True(t, sandbox.RetainWhileSuspended)
+	require.NotNil(t, sandbox.ExpiresAt)
+	originalExpiry := sandbox.ExpiresAt.AsTime()
+	require.Equal(t, activeTTL, originalExpiry.Sub(sandbox.CreatedAt.AsTime()))
+
+	data := []byte("investigation evidence retained across suspension\n")
+	writer, err := f.files.WriteFile(f.guestContext(id))
+	require.NoError(t, err)
+	require.NoError(t, writer.Send(&guestpb.WriteFileRequest{Path: "evidence.txt", Mode: 0600}))
+	require.NoError(t, writer.Send(&guestpb.WriteFileRequest{Chunk: data}))
+	written, err := writer.CloseAndRecv()
+	require.NoError(t, err)
+	require.EqualValues(t, len(data), written.BytesWritten)
+
+	_, err = f.client.SuspendSandbox(f.ctx, &apiv1.SuspendSandboxRequest{SandboxId: id})
+	require.NoError(t, err)
+	suspended := f.wait(t, id, apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED)
+	require.Nil(t, suspended.ExpiresAt)
+
+	// A later, ordinary suspension must expire first. Its deletion proves an
+	// expiration sweep has passed the retained sandbox's original deadline.
+	ordinary := f.create(t, activeTTL)
+	require.False(t, ordinary.RetainWhileSuspended)
+	require.True(t, ordinary.ExpiresAt.AsTime().After(originalExpiry))
+	_, err = f.client.SuspendSandbox(f.ctx, &apiv1.SuspendSandboxRequest{SandboxId: ordinary.Id})
+	require.NoError(t, err)
+	ordinarySuspended := f.wait(t, ordinary.Id, apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED)
+	require.Equal(t, ordinary.ExpiresAt.AsTime(), ordinarySuspended.ExpiresAt.AsTime())
+	f.wait(t, ordinary.Id, apiv1.RuntimeState_RUNTIME_STATE_DELETED)
+
+	current, err := f.client.GetSandbox(f.ctx, &apiv1.GetSandboxRequest{SandboxId: id})
+	require.NoError(t, err)
+	require.Equal(t, apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED, current.Sandbox.State)
+	require.Equal(t, apiv1.RuntimeOperation_RUNTIME_OPERATION_NONE, current.Sandbox.Operation)
+	require.Nil(t, current.Sandbox.ExpiresAt)
+
+	resumeStarted := time.Now()
+	_, err = f.client.ResumeSandbox(f.ctx, &apiv1.ResumeSandboxRequest{SandboxId: id})
+	require.NoError(t, err)
+	resumed := f.wait(t, id, apiv1.RuntimeState_RUNTIME_STATE_READY)
+	require.Equal(t, id, resumed.Id)
+	require.True(t, resumed.RetainWhileSuspended)
+	require.NotNil(t, resumed.ExpiresAt)
+	require.True(t, resumed.ExpiresAt.AsTime().After(originalExpiry))
+	require.WithinRange(t, resumed.ExpiresAt.AsTime(), resumeStarted.Add(activeTTL-time.Second), time.Now().Add(activeTTL+time.Second))
+	require.Equal(t, data, f.read(t, id, "evidence.txt"))
+
+	again, err := f.client.ResumeSandbox(f.ctx, &apiv1.ResumeSandboxRequest{SandboxId: id})
+	require.NoError(t, err)
+	require.Equal(t, id, again.Sandbox.Id)
+	require.Equal(t, resumed.ExpiresAt.AsTime(), again.Sandbox.ExpiresAt.AsTime(), "duplicate resume must not renew the active lifetime")
+
+	_, err = f.client.DeleteSandbox(f.ctx, &apiv1.DeleteSandboxRequest{SandboxId: id})
+	require.NoError(t, err)
+	f.wait(t, id, apiv1.RuntimeState_RUNTIME_STATE_DELETED)
 }
 
 func TestSandboxTemplateRevisionRetention(t *testing.T) {

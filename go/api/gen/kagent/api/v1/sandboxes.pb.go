@@ -36,9 +36,12 @@ type Sandbox struct {
 	Name             string                 `protobuf:"bytes,8,opt,name=name,proto3" json:"name,omitempty"`
 	CreatedAt        *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	UpdatedAt        *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
-	ExpiresAt        *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Absent while a retained sandbox is stably suspended. A pending resume has
+	// a deadline even before the guest is ready.
+	ExpiresAt            *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	RetainWhileSuspended bool                   `protobuf:"varint,12,opt,name=retain_while_suspended,json=retainWhileSuspended,proto3" json:"retain_while_suspended,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *Sandbox) Reset() {
@@ -148,15 +151,28 @@ func (x *Sandbox) GetExpiresAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *Sandbox) GetRetainWhileSuspended() bool {
+	if x != nil {
+		return x.RetainWhileSuspended
+	}
+	return false
+}
+
 type CreateSandboxRequest struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	SandboxTemplate *ResourceReference     `protobuf:"bytes,1,opt,name=sandbox_template,json=sandboxTemplate,proto3" json:"sandbox_template,omitempty"`
 	RequestId       string                 `protobuf:"bytes,2,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	Name            string                 `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
-	// Omission uses the operator's default. Lifetime is not extended by activity.
-	Ttl           *durationpb.Duration `protobuf:"bytes,4,opt,name=ttl,proto3" json:"ttl,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Omission uses the operator's default. Activity never extends the deadline.
+	// With retain_while_suspended, this bounds creation and each resumed interval.
+	Ttl *durationpb.Duration `protobuf:"bytes,4,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	// Keep durable files without an expiration deadline once suspension completes.
+	// Admission of a resume from stable suspension starts a fresh ttl interval;
+	// retries and duplicate resumes never extend it. Delete explicitly to release
+	// retained storage. False preserves the fixed lifetime from creation.
+	RetainWhileSuspended bool `protobuf:"varint,5,opt,name=retain_while_suspended,json=retainWhileSuspended,proto3" json:"retain_while_suspended,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *CreateSandboxRequest) Reset() {
@@ -215,6 +231,13 @@ func (x *CreateSandboxRequest) GetTtl() *durationpb.Duration {
 		return x.Ttl
 	}
 	return nil
+}
+
+func (x *CreateSandboxRequest) GetRetainWhileSuspended() bool {
+	if x != nil {
+		return x.RetainWhileSuspended
+	}
+	return false
 }
 
 type CreateSandboxResponse struct {
@@ -721,7 +744,7 @@ var File_kagent_api_v1_sandboxes_proto protoreflect.FileDescriptor
 
 const file_kagent_api_v1_sandboxes_proto_rawDesc = "" +
 	"\n" +
-	"\x1dkagent/api/v1/sandboxes.proto\x12\rkagent.api.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1akagent/api/v1/common.proto\x1a\x1bkagent/api/v1/runtime.proto\x1a\x1ckagent/api/v1/sessions.proto\"\x96\x04\n" +
+	"\x1dkagent/api/v1/sandboxes.proto\x12\rkagent.api.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1akagent/api/v1/common.proto\x1a\x1bkagent/api/v1/runtime.proto\x1a\x1ckagent/api/v1/sessions.proto\"\xcc\x04\n" +
 	"\aSandbox\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
 	"\acreator\x18\x02 \x01(\tR\acreator\x12K\n" +
@@ -737,7 +760,8 @@ const file_kagent_api_v1_sandboxes_proto_rawDesc = "" +
 	"updated_at\x18\n" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x129\n" +
 	"\n" +
-	"expires_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"\xf3\x01\n" +
+	"expires_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x124\n" +
+	"\x16retain_while_suspended\x18\f \x01(\bR\x14retainWhileSuspended\"\xa9\x02\n" +
 	"\x14CreateSandboxRequest\x12S\n" +
 	"\x10sandbox_template\x18\x01 \x01(\v2 .kagent.api.v1.ResourceReferenceB\x06\xbaH\x03\xc8\x01\x01R\x0fsandboxTemplate\x12)\n" +
 	"\n" +
@@ -745,7 +769,8 @@ const file_kagent_api_v1_sandboxes_proto_rawDesc = "" +
 	"\xbaH\ar\x05\x10\x01\x18\x80\x01R\trequestId\x12\x1c\n" +
 	"\x04name\x18\x03 \x01(\tB\b\xbaH\x05r\x03\x18\xc8\x01R\x04name\x12=\n" +
 	"\x03ttl\x18\x04 \x01(\v2\x19.google.protobuf.DurationB\x10\xbaH\r\xaa\x01\n" +
-	"\"\x04\b\x80\xa3\x052\x02\b\x01R\x03ttl\"I\n" +
+	"\"\x04\b\x80\xa3\x052\x02\b\x01R\x03ttl\x124\n" +
+	"\x16retain_while_suspended\x18\x05 \x01(\bR\x14retainWhileSuspended\"I\n" +
 	"\x15CreateSandboxResponse\x120\n" +
 	"\asandbox\x18\x01 \x01(\v2\x16.kagent.api.v1.SandboxR\asandbox\"<\n" +
 	"\x11GetSandboxRequest\x12'\n" +

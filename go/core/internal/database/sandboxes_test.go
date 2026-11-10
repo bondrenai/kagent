@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
@@ -298,4 +299,289 @@ func TestSandboxLifecycleSupersedesEndedAttempts(t *testing.T) {
 	_, err = client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
 	require.ErrorIs(t, err, ErrFailedPrecondition, "deletion must not be canceled into leaked compute")
 	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE)
+}
+
+func TestRetainedSandboxSurvivesSuspendedExpiration(t *testing.T) {
+	// Given a retained sandbox whose original active deadline passes while suspended.
+	pool := setupTestDB(t)
+	client := NewClient(pool, "public")
+	ctx := t.Context()
+	input, options := sandboxFixture(t, client, "retained")
+	input.RetainWhileSuspended = true
+	options.TTL = time.Second
+	created, _, err := client.CreateSandbox(ctx, input, "create", options)
+	require.NoError(t, err)
+	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_CREATE)
+	suspended := finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_SUSPEND)
+	require.Nil(t, suspended.ExpiresAt)
+	waitForSandboxDeadline(t, created)
+
+	// When a fresh client loads it and expiration attempts deletion.
+	reopened := NewClient(pool, "public")
+	saved, err := reopened.GetSandbox(ctx, created.Id, input.Creator)
+	require.NoError(t, err)
+	expired, err := reopened.ListExpiredSandboxes(ctx, "", 100)
+	require.NoError(t, err)
+	_, err = reopened.BeginExpiredSandboxDeletion(ctx, created.Id)
+
+	// Assert that the workspace and its revision remain retained without a deadline.
+	require.ErrorIs(t, err, ErrFailedPrecondition)
+	require.True(t, saved.RetainWhileSuspended)
+	require.Equal(t, apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED, saved.State)
+	require.Nil(t, saved.ExpiresAt)
+	require.NotContains(t, expired, created.Id)
+	require.NoError(t, reopened.RetireSandboxTemplateIdentities(ctx, "team-a", "scratch"))
+	garbage, err := reopened.BeginRuntimeRevisionDeletion(ctx, "retained")
+	require.NoError(t, err)
+	require.Nil(t, garbage)
+	deleted := finishSandbox(t, reopened, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE)
+	require.Equal(t, apiv1.RuntimeState_RUNTIME_STATE_DELETED, deleted.State)
+	garbage, err = reopened.BeginRuntimeRevisionDeletion(ctx, "retained")
+	require.NoError(t, err)
+	require.NotNil(t, garbage, "explicit deletion releases the retained revision")
+}
+
+func TestRetainedSandboxResumeRenewsOnlyOnce(t *testing.T) {
+	// Given a retained suspension past its original, fractional active TTL.
+	client := NewClient(setupTestDB(t), "public")
+	ctx := t.Context()
+	input, options := sandboxFixture(t, client, "retained")
+	input.RetainWhileSuspended = true
+	options.TTL = 1250*time.Millisecond + 123*time.Microsecond
+	created, _, err := client.CreateSandbox(ctx, input, "create", options)
+	require.NoError(t, err)
+	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_CREATE)
+	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_SUSPEND)
+	waitForSandboxDeadline(t, created)
+
+	// A creation retry cannot alter the stored active TTL or retention policy.
+	options.TTL = time.Hour
+	input.RetainWhileSuspended = false
+	retried, wasCreated, err := client.CreateSandbox(ctx, input, "create", options)
+	require.NoError(t, err)
+	require.False(t, wasCreated)
+	require.True(t, retried.RetainWhileSuspended)
+	require.Nil(t, retried.ExpiresAt)
+
+	// When concurrent callers resume it, every caller observes the same admission.
+	const requests = 8
+	type response struct {
+		operation *SandboxOperation
+		err       error
+	}
+	start := make(chan struct{})
+	responses := make(chan response, requests)
+	before := time.Now()
+	for range requests {
+		go func() {
+			<-start
+			op, err := client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
+			responses <- response{operation: op, err: err}
+		}()
+	}
+	close(start)
+	var first *SandboxOperation
+	for range requests {
+		result := <-responses
+		require.NoError(t, result.err)
+		if first == nil {
+			first = result.operation
+		}
+		require.Equal(t, first.ID, result.operation.ID)
+		require.True(t, proto.Equal(first.Instance.ExpiresAt, result.operation.Instance.ExpiresAt))
+	}
+
+	// Assert that only the original bounded duration was restored, including its fraction.
+	deadline := first.Instance.ExpiresAt.AsTime()
+	require.GreaterOrEqual(t, deadline.Sub(before), 1250*time.Millisecond)
+	require.LessOrEqual(t, time.Until(deadline), 1250*time.Millisecond+124*time.Microsecond)
+	require.Equal(t, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME, first.Instance.Operation)
+	ready := finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
+	require.True(t, proto.Equal(first.Instance.ExpiresAt, ready.ExpiresAt))
+	duplicate, err := client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
+	require.NoError(t, err)
+	require.Equal(t, apiv1.RuntimeOperation_RUNTIME_OPERATION_NONE, duplicate.Instance.Operation)
+	require.True(t, proto.Equal(first.Instance.ExpiresAt, duplicate.Instance.ExpiresAt), "a ready sandbox does not renew on duplicate resume")
+
+	// A later completed pause starts a distinct active period on its next resume.
+	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_SUSPEND)
+	second, err := client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID, second.ID)
+	require.True(t, second.Instance.ExpiresAt.AsTime().After(deadline))
+}
+
+func TestRetainedSandboxPendingResumeStillExpires(t *testing.T) {
+	// Given a retained sandbox with an abandoned resume attempt.
+	client := NewClient(setupTestDB(t), "public")
+	ctx := t.Context()
+	input, options := sandboxFixture(t, client, "retained")
+	input.RetainWhileSuspended = true
+	options.TTL = time.Second
+	created, _, err := client.CreateSandbox(ctx, input, "create", options)
+	require.NoError(t, err)
+	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_CREATE)
+	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_SUSPEND)
+	resume, err := client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
+	require.NoError(t, err)
+	executor := uuid.New()
+	claimed, err := client.ClaimSandboxOperation(ctx, created.Id, resume.ID, executor)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NoError(t, client.ReleaseRuntimeOperation(ctx, created.Id, resume.ID, executor))
+	waitForSandboxDeadline(t, resume.Instance)
+
+	// When expiration deletes it, a retry cannot reset its deadline or revive it.
+	expired, err := client.ListExpiredSandboxes(ctx, "", 100)
+	require.NoError(t, err)
+	require.Contains(t, expired, created.Id)
+	_, err = client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
+	require.ErrorIs(t, err, ErrFailedPrecondition)
+	deletion, err := client.BeginExpiredSandboxDeletion(ctx, created.Id)
+	require.NoError(t, err)
+	require.Equal(t, apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE, deletion.Instance.Operation)
+	require.True(t, proto.Equal(resume.Instance.ExpiresAt, deletion.Instance.ExpiresAt))
+	_, err = client.FinishSandboxOperation(ctx, created.Id, resume.ID, executor, "")
+	require.ErrorIs(t, err, ErrConflict)
+	_, err = client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
+	require.ErrorIs(t, err, ErrFailedPrecondition)
+	deleted := finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE)
+	require.Equal(t, apiv1.RuntimeState_RUNTIME_STATE_DELETED, deleted.State)
+}
+
+func TestSandboxExpirationRechecksCompletedSuspensionAndResume(t *testing.T) {
+	// Given an expiration candidate whose suspension has not yet completed.
+	client := NewClient(setupTestDB(t), "public")
+	ctx := t.Context()
+	input, options := sandboxFixture(t, client, "retained")
+	input.RetainWhileSuspended = true
+	options.TTL = time.Second
+	created, _, err := client.CreateSandbox(ctx, input, "create", options)
+	require.NoError(t, err)
+	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_CREATE)
+	suspend, err := client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_SUSPEND)
+	require.NoError(t, err)
+	executor := uuid.New()
+	claimed, err := client.ClaimSandboxOperation(ctx, created.Id, suspend.ID, executor)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	waitForSandboxDeadline(t, created)
+	expired, err := client.ListExpiredSandboxes(ctx, "", 100)
+	require.NoError(t, err)
+	require.Contains(t, expired, created.Id)
+
+	// When suspension finishes before the selected candidate is deleted.
+	suspended, err := client.FinishSandboxOperation(ctx, created.Id, suspend.ID, executor, "")
+	require.NoError(t, err)
+	require.Nil(t, suspended.ExpiresAt)
+	_, err = client.BeginExpiredSandboxDeletion(ctx, created.Id)
+	require.ErrorIs(t, err, ErrFailedPrecondition, "stale selection cannot delete a completed retained suspension")
+	resume, err := client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
+	require.NoError(t, err)
+	_, err = client.BeginExpiredSandboxDeletion(ctx, created.Id)
+
+	// Assert that the same stale selection also cannot delete its new active period.
+	require.ErrorIs(t, err, ErrFailedPrecondition)
+	current, err := client.GetSandboxOperation(ctx, created.Id)
+	require.NoError(t, err)
+	require.Equal(t, resume.ID, current.ID)
+	require.True(t, proto.Equal(resume.Instance.ExpiresAt, current.Instance.ExpiresAt))
+}
+
+func TestSandboxExpirationWinsBeforeSuspensionCompletes(t *testing.T) {
+	// Given an expired pending suspension whose attempt has ended.
+	client := NewClient(setupTestDB(t), "public")
+	ctx := t.Context()
+	input, options := sandboxFixture(t, client, "retained")
+	input.RetainWhileSuspended = true
+	options.TTL = time.Second
+	created, _, err := client.CreateSandbox(ctx, input, "create", options)
+	require.NoError(t, err)
+	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_CREATE)
+	suspend, err := client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_SUSPEND)
+	require.NoError(t, err)
+	executor := uuid.New()
+	claimed, err := client.ClaimSandboxOperation(ctx, created.Id, suspend.ID, executor)
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.NoError(t, client.ReleaseRuntimeOperation(ctx, created.Id, suspend.ID, executor))
+	waitForSandboxDeadline(t, created)
+
+	// When expiration admits deletion before a late suspension completion.
+	deletion, err := client.BeginExpiredSandboxDeletion(ctx, created.Id)
+	require.NoError(t, err)
+	_, err = client.FinishSandboxOperation(ctx, created.Id, suspend.ID, executor, "")
+
+	// Assert that stale completion cannot turn the deleting workspace into a retained one.
+	require.ErrorIs(t, err, ErrConflict)
+	require.NotEqual(t, suspend.ID, deletion.ID)
+	_, err = client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
+	require.ErrorIs(t, err, ErrFailedPrecondition)
+	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE)
+}
+
+func TestDefaultSandboxSuspensionKeepsFixedExpiration(t *testing.T) {
+	// Given a sandbox created without retention and then suspended.
+	client := NewClient(setupTestDB(t), "public")
+	ctx := t.Context()
+	input, options := sandboxFixture(t, client, "ordinary")
+	options.TTL = time.Second
+	created, _, err := client.CreateSandbox(ctx, input, "create", options)
+	require.NoError(t, err)
+	finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_CREATE)
+	suspended := finishSandbox(t, client, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_SUSPEND)
+	require.False(t, suspended.RetainWhileSuspended)
+	require.True(t, proto.Equal(created.ExpiresAt, suspended.ExpiresAt))
+	waitForSandboxDeadline(t, created)
+
+	// When the original deadline passes, ordinary expiration still applies.
+	expired, err := client.ListExpiredSandboxes(ctx, "", 100)
+	require.NoError(t, err)
+	require.Contains(t, expired, created.Id)
+	_, err = client.BeginSandboxOperation(ctx, created.Id, apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME)
+	require.ErrorIs(t, err, ErrFailedPrecondition)
+	deletion, err := client.BeginExpiredSandboxDeletion(ctx, created.Id)
+	require.NoError(t, err)
+	require.Equal(t, apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE, deletion.Instance.Operation)
+}
+
+func TestSandboxRetentionPreservesLegacyViewReaders(t *testing.T) {
+	// Given the migrated schema and a sandbox created by the new controller.
+	client := NewClient(setupTestDB(t), "public")
+	input, options := sandboxFixture(t, client, "retained")
+	input.RetainWhileSuspended = true
+	created, _, err := client.CreateSandbox(t.Context(), input, "create", options)
+	require.NoError(t, err)
+
+	// When the previous controller's exact SELECT * projection is decoded with
+	// its strict pgx row type, additive storage fields must not appear in the view.
+	type legacySandboxRow struct {
+		runtimeInstanceRow
+		Data                []byte
+		RequestID           string
+		Namespace           string
+		SandboxTemplateName string
+		RevisionReceipt     string
+		RequestHash         []byte
+		ExpiresAt           time.Time
+	}
+	legacy, err := queryOne(t.Context(), client.db,
+		`SELECT * FROM sandbox_record WHERE id = $1 AND user_id = $2`,
+		pgx.RowToStructByName[legacySandboxRow], created.Id, created.Creator)
+
+	// Assert that a mixed-version reader still loads the existing sandbox shape.
+	require.NoError(t, err)
+	require.Equal(t, created.Id, legacy.ID.String())
+	require.Equal(t, created.Creator, legacy.UserID)
+	require.Equal(t, "retained", legacy.RevisionReceipt)
+	require.Equal(t, "create", legacy.RequestID)
+	require.True(t, created.ExpiresAt.AsTime().Equal(legacy.ExpiresAt))
+}
+
+func waitForSandboxDeadline(t *testing.T, instance *apiv1.Sandbox) {
+	t.Helper()
+	require.NotNil(t, instance.ExpiresAt)
+	require.Eventually(t, func() bool {
+		return time.Now().After(instance.ExpiresAt.AsTime())
+	}, 3*time.Second, 10*time.Millisecond)
 }
