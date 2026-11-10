@@ -44,21 +44,23 @@ type sandboxInput struct {
 }
 
 type sandboxSummary struct {
-	ID        string                   `json:"id"`
-	Template  *apiv1.ResourceReference `json:"sandbox_template"`
-	Name      string                   `json:"name,omitempty"`
-	State     string                   `json:"state"`
-	Operation string                   `json:"operation"`
-	ExpiresAt string                   `json:"expires_at"`
-	Failure   *apiv1.Failure           `json:"failure,omitempty"`
+	ID                   string                   `json:"id"`
+	Template             *apiv1.ResourceReference `json:"sandbox_template"`
+	Name                 string                   `json:"name,omitempty"`
+	State                string                   `json:"state"`
+	Operation            string                   `json:"operation"`
+	ExpiresAt            string                   `json:"expires_at,omitempty"`
+	RetainWhileSuspended bool                     `json:"retain_while_suspended"`
+	Failure              *apiv1.Failure           `json:"failure,omitempty"`
 }
 
 type sandboxCreateInput struct {
-	Namespace  string `json:"namespace"`
-	Template   string `json:"template" jsonschema:"SandboxTemplate name"`
-	RequestID  string `json:"request_id" jsonschema:"Stable idempotency key; reuse for retries with identical inputs"`
-	Name       string `json:"name,omitempty"`
-	TTLSeconds int64  `json:"ttl_seconds,omitempty" jsonschema:"Lifetime in seconds; omission uses operator policy"`
+	Namespace            string `json:"namespace"`
+	Template             string `json:"template" jsonschema:"SandboxTemplate name"`
+	RequestID            string `json:"request_id" jsonschema:"Stable idempotency key; reuse for retries with identical inputs"`
+	Name                 string `json:"name,omitempty"`
+	TTLSeconds           int64  `json:"ttl_seconds,omitempty" jsonschema:"Lifetime in seconds; omission uses operator policy"`
+	RetainWhileSuspended bool   `json:"retain_while_suspended,omitempty" jsonschema:"Retain durable files without expiry while stably suspended; resume starts a fresh bounded TTL interval"`
 }
 
 type sandboxListInput struct {
@@ -206,8 +208,12 @@ func readLine(r *bufio.Reader) (line []byte, cut bool, err error) {
 }
 
 func summarizeSandbox(value *apiv1.Sandbox) sandboxSummary {
-	return sandboxSummary{ID: value.Id, Template: value.SandboxTemplate, Name: value.Name,
-		State: value.State.String(), Operation: value.Operation.String(), ExpiresAt: value.ExpiresAt.AsTime().Format(time.RFC3339Nano), Failure: value.Failure}
+	result := sandboxSummary{ID: value.Id, Template: value.SandboxTemplate, Name: value.Name,
+		State: value.State.String(), Operation: value.Operation.String(), RetainWhileSuspended: value.RetainWhileSuspended, Failure: value.Failure}
+	if value.ExpiresAt != nil {
+		result.ExpiresAt = value.ExpiresAt.AsTime().Format(time.RFC3339Nano)
+	}
+	return result
 }
 
 // The MCP SDK supplies schemas and JSON content. Service errors belong in tool
@@ -255,7 +261,7 @@ func registerSandboxTools(server *mcp.Server, service *sandbox.Service, template
 		return
 	}
 	addSandboxTool(server, "create_sandbox", "Create a temporary workspace from a prepared SandboxTemplate. Retain request_id and identical inputs for lifecycle retries. Check state, operation, and expires_at before guest calls. No network egress is currently allowed; files belong under /data/workspace.", func(ctx context.Context, in sandboxCreateInput) (sandboxSummary, error) {
-		request := &apiv1.CreateSandboxRequest{SandboxTemplate: &apiv1.ResourceReference{Namespace: in.Namespace, Name: in.Template}, RequestId: in.RequestID, Name: in.Name}
+		request := &apiv1.CreateSandboxRequest{SandboxTemplate: &apiv1.ResourceReference{Namespace: in.Namespace, Name: in.Template}, RequestId: in.RequestID, Name: in.Name, RetainWhileSuspended: in.RetainWhileSuspended}
 		if in.TTLSeconds != 0 {
 			request.Ttl = &durationpb.Duration{Seconds: in.TTLSeconds}
 		}

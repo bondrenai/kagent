@@ -13,21 +13,83 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	guestpb "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	apiauthorization "github.com/kagent-dev/kagent/go/api/authorization"
+	apiv1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1"
 	"github.com/kagent-dev/kagent/go/api/v1alpha3"
 	"github.com/kagent-dev/kagent/go/core/internal/service/kubecrud"
 	"github.com/kagent-dev/kagent/go/core/internal/service/sandbox"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 )
+
+func TestSandboxSummaryRetention(t *testing.T) {
+	deadline := timestamppb.New(time.Date(2026, time.November, 10, 12, 0, 0, 0, time.UTC))
+	scenarios := []struct {
+		name      string
+		retained  bool
+		state     apiv1.RuntimeState
+		operation apiv1.RuntimeOperation
+		expiresAt *timestamppb.Timestamp
+		want      string
+	}{
+		{
+			name:     "Given a retained suspended sandbox, when its MCP summary is encoded, assert that no expiration is published",
+			retained: true, state: apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED, operation: apiv1.RuntimeOperation_RUNTIME_OPERATION_NONE,
+			want: `{"id":"sandbox","sandbox_template":null,"state":"RUNTIME_STATE_SUSPENDED","operation":"RUNTIME_OPERATION_NONE","retain_while_suspended":true}`,
+		},
+		{
+			name:     "Given a retained sandbox with pending resume, when its MCP summary is encoded, assert that its bounded deadline is published",
+			retained: true, state: apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED, operation: apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME, expiresAt: deadline,
+			want: `{"id":"sandbox","sandbox_template":null,"state":"RUNTIME_STATE_SUSPENDED","operation":"RUNTIME_OPERATION_RESUME","retain_while_suspended":true,"expires_at":"2026-11-10T12:00:00Z"}`,
+		},
+		{
+			name:  "Given a default suspended sandbox, when its MCP summary is encoded, assert that the original deadline remains visible",
+			state: apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED, operation: apiv1.RuntimeOperation_RUNTIME_OPERATION_NONE, expiresAt: deadline,
+			want: `{"id":"sandbox","sandbox_template":null,"state":"RUNTIME_STATE_SUSPENDED","operation":"RUNTIME_OPERATION_NONE","retain_while_suspended":false,"expires_at":"2026-11-10T12:00:00Z"}`,
+		},
+	}
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			output := summarizeSandbox(&apiv1.Sandbox{Id: "sandbox", State: scenario.state, Operation: scenario.operation,
+				RetainWhileSuspended: scenario.retained, ExpiresAt: scenario.expiresAt})
+			data, err := json.Marshal(output)
+			require.NoError(t, err)
+			require.JSONEq(t, scenario.want, string(data))
+		})
+	}
+}
+
+func TestSandboxRetentionToolSchema(t *testing.T) {
+	t.Run("Given sandbox tools, when a client discovers create_sandbox, assert that retention is an optional boolean", func(t *testing.T) {
+		handler, err := New(Config{Agents: testAgentService(t), Sessions: testSessionService(), Checkpoints: testCheckpointService(), Gateway: &a2asrv.InterceptedHandler{Handler: &fakeGateway{}}, Sandboxes: &sandbox.Service{}})
+		require.NoError(t, err)
+		server := httptest.NewServer(handler)
+		t.Cleanup(server.Close)
+		list := rawMCPCall(t, server.URL, "tools/list", map[string]any{}, false)
+		for _, value := range list["result"].(map[string]any)["tools"].([]any) {
+			tool := value.(map[string]any)
+			if tool["name"] != "create_sandbox" {
+				continue
+			}
+			schema := tool["inputSchema"].(map[string]any)
+			field := schema["properties"].(map[string]any)["retain_while_suspended"].(map[string]any)
+			require.Equal(t, "boolean", field["type"])
+			require.NotContains(t, schema["required"], "retain_while_suspended")
+			return
+		}
+		t.Fatal("create_sandbox was not registered")
+	})
+}
 
 func TestSandboxProcessExitCode(t *testing.T) {
 	for _, test := range []struct {

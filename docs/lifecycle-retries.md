@@ -39,6 +39,16 @@ for subsequent invocations. Omitting it generates a new ID on each invocation,
 so rerunning that command is a new creation rather than a retry. MCP callers
 should likewise retain the `request_id` passed to `create_sandbox`.
 
+Sandbox creation with `retain_while_suspended: true` (CLI:
+`--retain-while-suspended`) removes the expiration deadline only after suspension
+completes with `SUSPENDED/NONE`. Beginning a resume from that state starts the
+original bounded TTL again; time spent in a pending resume counts toward it.
+Retrying that resume, repeating it after success, or replaying creation does not
+renew the deadline. An unfinished suspend retains its deadline. Get/List and
+guest activity never renew it. Retained suspended sandboxes require explicit
+deletion to release storage; default sandboxes keep their creation deadline even
+while suspended.
+
 ## Errors
 
 | gRPC status | Client action |
