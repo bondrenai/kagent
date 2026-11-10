@@ -324,4 +324,38 @@ func TestSandboxTransports(t *testing.T) {
 	_, err = client.DeleteSandbox(ctx, &apiv1.DeleteSandboxRequest{SandboxId: id})
 	require.NoError(t, err)
 	require.Equal(t, []string{"create", "policy", "resume", "suspend", "suspend", "policy", "resume", "delete"}, actors.observedCalls())
+
+	t.Run("retained suspension through MCP is visible through gRPC", func(t *testing.T) {
+		result, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: "create_sandbox", Arguments: map[string]any{
+			"namespace": "team-a", "template": "scratch", "request_id": "retained",
+			"retain_while_suspended": true,
+		}})
+		require.NoError(t, err)
+		require.False(t, result.IsError, "%+v", result.Content)
+		var value struct {
+			ID string `json:"id"`
+		}
+		content, ok := result.Content[0].(*sdkmcp.TextContent)
+		require.True(t, ok)
+		require.NoError(t, json.Unmarshal([]byte(content.Text), &value))
+		require.NotEmpty(t, value.ID)
+		result, err = session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: "suspend_sandbox", Arguments: map[string]any{
+			"sandbox_id": value.ID,
+		}})
+		require.NoError(t, err)
+		require.False(t, result.IsError, "%+v", result.Content)
+		encoded, err := json.Marshal(result.StructuredContent)
+		require.NoError(t, err)
+		var summary map[string]any
+		require.NoError(t, json.Unmarshal(encoded, &summary))
+		require.Equal(t, true, summary["retain_while_suspended"])
+		require.NotContains(t, summary, "expires_at")
+		current, err := client.GetSandbox(ctx, &apiv1.GetSandboxRequest{SandboxId: value.ID})
+		require.NoError(t, err)
+		require.True(t, current.Sandbox.RetainWhileSuspended)
+		require.Nil(t, current.Sandbox.ExpiresAt)
+		require.Equal(t, apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED, current.Sandbox.State)
+		_, err = client.DeleteSandbox(ctx, &apiv1.DeleteSandboxRequest{SandboxId: value.ID})
+		require.NoError(t, err)
+	})
 }

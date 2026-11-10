@@ -131,7 +131,8 @@ contact image registries.
 The remaining `config.sandboxes` settings configure CPU, memory, and default/max
 TTL. Helm supplies these through the controller ConfigMap. Defaults are one CPU,
 1 GiB memory, a one-hour TTL, and a 24-hour maximum TTL. Activity does not extend
-expiration.
+expiration. Creation can opt into retention while suspended, as described below;
+creation and resumed execution still use these TTL bounds.
 
 Sandboxes have no allowed egress destinations by default. Select same-namespace
 [EgressPolicy resources](egress-policies.md) through `SandboxTemplate.spec.egressPolicyRefs`
@@ -151,6 +152,27 @@ Concurrent requests use the unique creator/request-ID constraint and read the
 winning insert, as Session creation does; there is no per-owner advisory lock or
 sandbox count limit. Retrying with the same request ID and identical input returns the
 same resource; it cannot allocate another Actor or extend the original lifetime.
+
+By default, suspension leaves that fixed lifetime unchanged. Creating with
+`retain_while_suspended: true` instead retains the durable workspace indefinitely
+once suspension completes with `state: SUSPENDED` and `operation: NONE`.
+`expires_at` is absent in that state. Beginning a resume starts a new interval
+using the TTL resolved at creation, including time spent waiting for resume to
+finish. A failed or abandoned resume still expires; retries and repeated resumes
+of an already running sandbox never extend its deadline. An incomplete suspend
+also keeps its deadline until suspension successfully completes.
+
+Retention is part of the immutable create input and cannot be enabled afterward.
+It retains the same sandbox and its pinned runtime artifacts, not a separate
+checkpoint or fork. It preserves durable files, not running processes or process
+handles. Delete retained sandboxes explicitly when finished: suspended storage
+has no automatic expiration and depends on the underlying database and snapshot
+storage remaining available.
+
+Upgrade every controller replica before creating retained sandboxes. Older
+expiration workers do not honor this option and can delete suspended workspaces.
+Downgrading while retained sandboxes exist is unsupported; retrieve any needed
+files and delete those sandboxes first.
 
 Sessions and Sandboxes use the shared `RuntimeState` and `RuntimeOperation`
 protobuf enums. State values include `CREATING`, `READY`, `SUSPENDED`, `FAILED`,
@@ -316,6 +338,12 @@ An interrupted file write reports an error and does not reserve lifecycle access
 settings. `templates`, `create`, `list`, `get`, `suspend`, `resume`, and `delete`
 cover discovery and lifecycle. Creation requires a retained `--request-id`;
 mutations make one attempt and follow the [retry contract](../lifecycle-retries.md).
+
+Use `create TEMPLATE --request-id ID --retain-while-suspended --ttl 1h` to retain
+the workspace between bounded execution intervals. The table displays
+`retained while suspended` instead of an expiration date after suspension finishes.
+MCP accepts the same opt-in as `create_sandbox.retain_while_suspended`; summaries
+include that flag and omit `expires_at` while retention applies.
 
 `exec ID -- COMMAND [ARG...]` starts a process once and waits by default. It
 copies stdout/stderr to the corresponding local streams and returns the remote

@@ -41,7 +41,10 @@ message Sandbox {
   string name = 8;
   google.protobuf.Timestamp created_at = 9;
   google.protobuf.Timestamp updated_at = 10;
+  // Absent while a retained sandbox is stably suspended. A pending resume has
+  // a deadline even before the guest is ready.
   google.protobuf.Timestamp expires_at = 11;
+  bool retain_while_suspended = 12;
 }
 
 message CreateSandboxRequest {
@@ -51,11 +54,17 @@ message CreateSandboxRequest {
     max_len: 128
   }];
   string name = 3 [(buf.validate.field).string.max_len = 200];
-  // Omission uses the operator's default. Lifetime is not extended by activity.
+  // Omission uses the operator's default. Activity never extends the deadline.
+  // With retain_while_suspended, this bounds creation and each resumed interval.
   google.protobuf.Duration ttl = 4 [(buf.validate.field).duration = {
     gte: {seconds: 1}
     lte: {seconds: 86400}
   }];
+  // Keep durable files without an expiration deadline once suspension completes.
+  // Admission of a resume from stable suspension starts a fresh ttl interval;
+  // retries and duplicate resumes never extend it. Delete explicitly to release
+  // retained storage. False preserves the fixed lifetime from creation.
+  bool retain_while_suspended = 5;
 }
 message CreateSandboxResponse {
   Sandbox sandbox = 1;

@@ -303,6 +303,45 @@ func TestExpirationCleansUpIncompleteCreation(t *testing.T) {
 	require.Contains(t, actors.observedCalls(), "delete")
 }
 
+func TestRetainedSandboxResumesAfterDeadlineAndServiceRestart(t *testing.T) {
+	service, ctx, actors := serviceFixture(t)
+	service.config.DefaultTTL = time.Second
+	request := createRequest()
+	request.RetainWhileSuspended = true
+	created, err := service.Create(ctx, request)
+	require.NoError(t, err)
+	require.True(t, created.RetainWhileSuspended)
+	suspended, err := service.Suspend(ctx, created.Id)
+	require.NoError(t, err)
+	require.Nil(t, suspended.ExpiresAt)
+	require.Eventually(t, func() bool {
+		return time.Now().After(created.ExpiresAt.AsTime())
+	}, 3*time.Second, 10*time.Millisecond)
+
+	restarted, err := NewService(service.config)
+	require.NoError(t, err)
+	require.NoError(t, restarted.expire(ctx, created.Id))
+	current, err := restarted.Get(ctx, created.Id)
+	require.NoError(t, err)
+	require.Equal(t, apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED, current.State)
+	require.Nil(t, current.ExpiresAt)
+
+	resumed, err := restarted.Resume(ctx, created.Id)
+	require.NoError(t, err)
+	require.Equal(t, created.Id, resumed.Id)
+	require.Equal(t, apiv1.RuntimeState_RUNTIME_STATE_READY, resumed.State)
+	require.True(t, resumed.ExpiresAt.AsTime().After(created.ExpiresAt.AsTime()))
+	// A previously selected expiration candidate must not delete a fresh resume.
+	require.NoError(t, restarted.expire(ctx, created.Id))
+	duplicate, err := restarted.Resume(ctx, created.Id)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(resumed.ExpiresAt, duplicate.ExpiresAt))
+	require.NotContains(t, actors.observedCalls(), "delete")
+	deleted, err := restarted.Delete(ctx, created.Id)
+	require.NoError(t, err)
+	require.Equal(t, apiv1.RuntimeState_RUNTIME_STATE_DELETED, deleted.State)
+}
+
 func TestSandboxConflictingRequestCanRetryAfterActiveAttempt(t *testing.T) {
 	service, ctx, actors := serviceFixture(t)
 	instance, err := service.Create(ctx, createRequest())

@@ -17,13 +17,15 @@ import (
 
 type sandboxRow struct {
 	runtimeInstanceRow
-	Data                []byte
-	RequestID           string
-	Namespace           string
-	SandboxTemplateName string
-	RevisionReceipt     string
-	RequestHash         []byte
-	ExpiresAt           time.Time
+	Data                 []byte
+	RequestID            string
+	Namespace            string
+	SandboxTemplateName  string
+	RevisionReceipt      string
+	RequestHash          []byte
+	ExpiresAt            time.Time
+	RetainWhileSuspended bool
+	ActiveTTLNS          int64
 }
 
 func (r sandboxRow) sandbox() (*apiv1.Sandbox, error) {
@@ -39,11 +41,22 @@ func (r sandboxRow) sandbox() (*apiv1.Sandbox, error) {
 	s.Id, s.Creator = r.ID.String(), r.UserID
 	s.State, s.Operation = state, operation
 	s.PreparedRevision, s.ExpiresAt = r.RevisionReceipt, timestamppb.New(r.ExpiresAt)
+	s.RetainWhileSuspended = r.RetainWhileSuspended
+	if r.retainedSuspension() {
+		s.ExpiresAt = nil
+	}
 	if s.SandboxTemplate == nil {
 		s.SandboxTemplate = &apiv1.ResourceReference{}
 	}
 	s.SandboxTemplate.Namespace, s.SandboxTemplate.Name = r.Namespace, r.SandboxTemplateName
 	return s, nil
+}
+
+// retainedSuspension identifies a completed, opted-in suspension. Pending work
+// keeps its active deadline so an abandoned resume can still expire.
+func (r sandboxRow) retainedSuspension() bool {
+	return r.RetainWhileSuspended && r.State == apiv1.RuntimeState_RUNTIME_STATE_SUSPENDED.String() &&
+		r.Operation == apiv1.RuntimeOperation_RUNTIME_OPERATION_NONE.String()
 }
 
 // saveSandboxPayload preserves the full protobuf, including unknown fields.
@@ -110,7 +123,11 @@ func (c *Client) CreateSandbox(ctx context.Context, request *apiv1.Sandbox, requ
 }
 
 func readSandboxRequest(ctx context.Context, db dbExecutor, userID, requestID string) (sandboxRow, error) {
-	return queryOne(ctx, db, `SELECT * FROM sandbox_record WHERE user_id = $1 AND request_id = $2`, pgx.RowToStructByName[sandboxRow], userID, requestID)
+	return queryOne(ctx, db, `
+		SELECT r.*, s.retain_while_suspended, s.active_ttl_ns
+		FROM sandbox_record r JOIN sandbox s USING (id)
+		WHERE r.user_id = $1 AND r.request_id = $2
+	`, pgx.RowToStructByName[sandboxRow], userID, requestID)
 }
 
 // insertSandbox reserves a new sandbox in CREATING/CREATE and pins the active
@@ -154,9 +171,11 @@ func insertSandbox(ctx context.Context, tx pgx.Tx, request *apiv1.Sandbox, reque
 		return sandboxRow{}, err
 	}
 	if err := execSQL(ctx, tx, `
-		INSERT INTO sandbox (id, namespace, sandbox_template_name, revision_receipt, request_hash, expires_at, data)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, instance.Id, instance.GetSandboxTemplate().GetNamespace(), instance.GetSandboxTemplate().GetName(), revision, options.RequestHash, instance.ExpiresAt.AsTime(), data); err != nil {
+		INSERT INTO sandbox (id, namespace, sandbox_template_name, revision_receipt, request_hash, expires_at, data,
+		    retain_while_suspended, active_ttl_ns)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, instance.Id, instance.GetSandboxTemplate().GetNamespace(), instance.GetSandboxTemplate().GetName(), revision, options.RequestHash, instance.ExpiresAt.AsTime(), data,
+		instance.GetRetainWhileSuspended(), int64(options.TTL)); err != nil {
 		return sandboxRow{}, err
 	}
 	return readSandbox(ctx, tx, instance.Id)
@@ -164,7 +183,11 @@ func insertSandbox(ctx context.Context, tx pgx.Tx, request *apiv1.Sandbox, reque
 
 // GetSandbox includes deletion tombstones so authorized retries can observe cleanup.
 func (c *Client) GetSandbox(ctx context.Context, id, userID string) (*apiv1.Sandbox, error) {
-	row, err := queryOne(ctx, c.db, `SELECT * FROM sandbox_record WHERE id = $1 AND user_id = $2`, pgx.RowToStructByName[sandboxRow], id, userID)
+	row, err := queryOne(ctx, c.db, `
+		SELECT r.*, s.retain_while_suspended, s.active_ttl_ns
+		FROM sandbox_record r JOIN sandbox s USING (id)
+		WHERE r.id = $1 AND r.user_id = $2
+	`, pgx.RowToStructByName[sandboxRow], id, userID)
 	if err != nil {
 		return nil, notFoundOr(err)
 	}
@@ -173,9 +196,11 @@ func (c *Client) GetSandbox(ctx context.Context, id, userID string) (*apiv1.Sand
 
 func (c *Client) ListSandboxes(ctx context.Context, userID, afterID string, limit int, template *apiv1.ResourceReference) ([]*apiv1.Sandbox, error) {
 	rows, err := queryMany(ctx, c.db, `
-		SELECT * FROM sandbox_record WHERE user_id = $1 AND state <> 'RUNTIME_STATE_DELETED'
-		    AND ($2::text = '' OR id > NULLIF($2, '')::uuid)
-		    AND ($4::text = '' OR (namespace = $4 AND sandbox_template_name = $5)) ORDER BY id LIMIT $3
+		SELECT r.*, s.retain_while_suspended, s.active_ttl_ns
+		FROM sandbox_record r JOIN sandbox s USING (id)
+		WHERE r.user_id = $1 AND r.state <> 'RUNTIME_STATE_DELETED'
+		    AND ($2::text = '' OR r.id > NULLIF($2, '')::uuid)
+		    AND ($4::text = '' OR (r.namespace = $4 AND r.sandbox_template_name = $5)) ORDER BY r.id LIMIT $3
 	`, pgx.RowToStructByName[sandboxRow], userID, afterID, limit, template.GetNamespace(), template.GetName())
 	if err != nil {
 		return nil, err
@@ -192,60 +217,114 @@ func (c *Client) ListSandboxes(ctx context.Context, userID, afterID string, limi
 }
 
 func readSandbox(ctx context.Context, db dbExecutor, id string) (sandboxRow, error) {
-	return queryOne(ctx, db, `SELECT * FROM sandbox_record WHERE id = $1`, pgx.RowToStructByName[sandboxRow], id)
+	return queryOne(ctx, db, `
+		SELECT r.*, s.retain_while_suspended, s.active_ttl_ns
+		FROM sandbox_record r JOIN sandbox s USING (id) WHERE r.id = $1
+	`, pgx.RowToStructByName[sandboxRow], id)
 }
 
 func lockSandbox(ctx context.Context, tx pgx.Tx, id string) (sandboxRow, error) {
-	return queryOne(ctx, tx, `SELECT * FROM sandbox_record WHERE id = $1 FOR UPDATE`, pgx.RowToStructByName[sandboxRow], id)
+	return queryOne(ctx, tx, `
+		SELECT r.*, s.retain_while_suspended, s.active_ttl_ns
+		FROM sandbox_record r JOIN sandbox s USING (id) WHERE r.id = $1 FOR UPDATE
+	`, pgx.RowToStructByName[sandboxRow], id)
 }
 
 type SandboxOperation = RuntimeOperation[*apiv1.Sandbox]
 
+// BeginSandboxOperation admits lifecycle work under the sandbox lock. A new
+// resume of a retained suspension starts its original active TTL once; retries
+// retain that deadline. Explicit deletion is allowed regardless of expiration.
 func (c *Client) BeginSandboxOperation(ctx context.Context, id string, kind apiv1.RuntimeOperation) (*SandboxOperation, error) {
-	var result SandboxOperation
+	var result *SandboxOperation
 	err := c.withTx(ctx, func(tx pgx.Tx) error {
 		row, err := lockSandbox(ctx, tx, id)
 		if err != nil {
 			return notFoundOr(err)
 		}
-		if kind != apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE {
-			expired, err := queryOne(ctx, tx, `SELECT expires_at <= clock_timestamp() FROM sandbox WHERE id = $1`, pgx.RowTo[bool], id)
-			if err != nil {
-				return err
-			}
-			if expired {
-				return ErrFailedPrecondition
-			}
-		}
-		needed, err := sandboxOperationNeeded(row.runtimeInstanceRow, kind)
-		if err != nil {
-			return err
-		}
-		if needed {
-			if row.ExecutorID != nil {
-				active, err := queryOne(ctx, tx, `SELECT executor_expires_at > clock_timestamp() FROM runtime_instance WHERE id = $1`, pgx.RowTo[bool], id)
-				if err != nil {
-					return err
-				}
-				if active {
-					return ErrConflict
-				}
-			}
-			row, err = beginSandboxOperation(ctx, tx, row, kind)
-			if err != nil {
-				return err
-			}
-		}
-		instance, err := row.sandbox()
-		if err != nil {
-			return err
-		}
-		result = runtimeOperationFor(row.runtimeInstanceRow, instance)
-		return nil
+		result, err = admitSandboxOperation(ctx, tx, row, kind)
+		return err
 	})
+	return result, err
+}
+
+// BeginExpiredSandboxDeletion rechecks an expiration candidate under its row
+// lock before admitting deletion. A resumed, retained, or deleted sandbox
+// returns ErrFailedPrecondition; a missing sandbox returns ErrNotFound.
+func (c *Client) BeginExpiredSandboxDeletion(ctx context.Context, id string) (*SandboxOperation, error) {
+	var result *SandboxOperation
+	err := c.withTx(ctx, func(tx pgx.Tx) error {
+		row, err := lockSandbox(ctx, tx, id)
+		if err != nil {
+			return notFoundOr(err)
+		}
+		expired, err := sandboxExpired(ctx, tx, row)
+		if err != nil {
+			return err
+		}
+		if !expired {
+			return ErrFailedPrecondition
+		}
+		result, err = admitSandboxOperation(ctx, tx, row, apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE)
+		return err
+	})
+	return result, err
+}
+
+// sandboxExpired evaluates the current deadline for a locked sandbox. Only a
+// completed retained suspension and a deletion tombstone have no deadline.
+func sandboxExpired(ctx context.Context, tx pgx.Tx, row sandboxRow) (bool, error) {
+	if row.retainedSuspension() || row.State == apiv1.RuntimeState_RUNTIME_STATE_DELETED.String() {
+		return false, nil
+	}
+	return queryOne(ctx, tx, `SELECT expires_at <= clock_timestamp() FROM sandbox WHERE id = $1`, pgx.RowTo[bool], row.ID)
+}
+
+// admitSandboxOperation shares lifecycle admission for explicit requests and
+// the expiration worker. The caller holds the sandbox lock and transaction.
+func admitSandboxOperation(ctx context.Context, tx pgx.Tx, row sandboxRow, kind apiv1.RuntimeOperation) (*SandboxOperation, error) {
+	if kind != apiv1.RuntimeOperation_RUNTIME_OPERATION_DELETE {
+		expired, err := sandboxExpired(ctx, tx, row)
+		if err != nil {
+			return nil, err
+		}
+		if expired {
+			return nil, ErrFailedPrecondition
+		}
+	}
+	needed, err := sandboxOperationNeeded(row.runtimeInstanceRow, kind)
 	if err != nil {
 		return nil, err
 	}
+	if needed {
+		if row.ExecutorID != nil {
+			active, err := queryOne(ctx, tx, `SELECT executor_expires_at > clock_timestamp() FROM runtime_instance WHERE id = $1`, pgx.RowTo[bool], row.ID)
+			if err != nil {
+				return nil, err
+			}
+			if active {
+				return nil, ErrConflict
+			}
+		}
+		if kind == apiv1.RuntimeOperation_RUNTIME_OPERATION_RESUME && row.retainedSuspension() {
+			row.ExpiresAt, err = queryOne(ctx, tx, `
+				UPDATE sandbox SET expires_at = clock_timestamp() + ($2::bigint / 1000) * interval '1 microsecond'
+				WHERE id = $1 RETURNING expires_at
+			`, pgx.RowTo[time.Time], row.ID, row.ActiveTTLNS)
+			if err != nil {
+				return nil, err
+			}
+		}
+		row, err = beginSandboxOperation(ctx, tx, row, kind)
+		if err != nil {
+			return nil, err
+		}
+	}
+	instance, err := row.sandbox()
+	if err != nil {
+		return nil, err
+	}
+	result := runtimeOperationFor(row.runtimeInstanceRow, instance)
 	return &result, nil
 }
 
@@ -375,10 +454,13 @@ func (c *Client) RecordSandboxOperationFailure(ctx context.Context, id string, o
 	})
 }
 
+// ListExpiredSandboxes returns expiration candidates ordered by ID. A completed
+// retained suspension is omitted; callers must recheck eligibility when deleting.
 func (c *Client) ListExpiredSandboxes(ctx context.Context, afterID string, limit int) ([]string, error) {
 	return queryMany(ctx, c.db, `SELECT s.id::text FROM sandbox s JOIN runtime_instance r USING (id)
 	    WHERE r.kind = 'sandbox' AND r.state <> 'RUNTIME_STATE_DELETED'
 	        AND s.expires_at <= clock_timestamp()
+	        AND NOT (s.retain_while_suspended AND r.state = 'RUNTIME_STATE_SUSPENDED' AND r.operation = 'RUNTIME_OPERATION_NONE')
 	        AND (NULLIF($1, '')::uuid IS NULL OR s.id > NULLIF($1, '')::uuid)
 	    ORDER BY s.id LIMIT $2`, pgx.RowTo[string], afterID, limit)
 }
